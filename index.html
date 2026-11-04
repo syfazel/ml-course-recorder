@@ -1133,6 +1133,212 @@
         return { schedule, syncNow, flush, queuedCount };
       })();
 
+      /* ================= progress transfer (cross-browser restore) =================
+         Progress no longer has to die with one browser. The transfer
+         file is a snapshot of EVERY local progress key (the «mlshell.*»
+         store: done lessons, quiz/exercise answers, recorder tables —
+         events, mistakes, teach-backs — lab notebooks, tour and guide
+         state) PLUS the unsent Supabase queue, so a batch that never
+         reached the teacher travels with the student and can still be
+         sent from the new device. On the other browser/device the
+         student opens this same page and imports the file; the import
+         MERGES instead of overwriting:
+           - id lists (done, quiz-seen, jupyter cells) are unioned;
+           - event/mistake rows are unioned by exact row content, so
+             re-importing the same file never duplicates a record;
+           - per-day rows, tours, notebooks and the send queue keep
+             the newer copy (queue rows dedupe by batch_id, and the
+             server itself answers 409 for an already-received batch).
+         After a merge the last-sent hash is cleared and a fresh full
+         snapshot is queued for the teacher, so the teacher's view
+         catches up from whichever device the student now uses. The
+         older Drive export file (meta + six tables) is also accepted
+         and rebuilt into the same local state. The file carries no
+         password, token, or secret key of any kind — only the
+         student's own progress rows. */
+      let pendingTransferImport = null;
+      const ProgressTransfer = (() => {
+        const FORMAT = "ml-course-progress";
+        const SKIP_KEYS = new Set(["mlshell.lastVisit", "mlshell.sessionPrevVisit", "mlshell.supabase.lastHash"]);
+        const rawGet = (k) => { try { const v = localStorage.getItem(k); return v === null ? undefined : JSON.parse(v); } catch { return undefined; } };
+        function collectState() {
+          const state = {};
+          try {
+            for (let i = 0; i < localStorage.length; i++) {
+              const k = localStorage.key(i);
+              if (!k) continue;
+              if (k.startsWith("mlshell.") || k === SUPA_QUEUE_KEY) {
+                const v = rawGet(k);
+                if (v !== undefined) state[k] = v;
+              }
+            }
+          } catch { /* storage unavailable */ }
+          delete state["mlshell.supabase.lastHash"];
+          return state;
+        }
+        function buildTransfer() {
+          const d = new Date();
+          const pad = (n) => String(n).padStart(2, "0");
+          const compact = `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
+          return {
+            format: FORMAT,
+            version: 1,
+            meta: { student: STUDENT_NAME, shellVersion: SHELL_VERSION, exportId: "prog-" + compact + "-" + Date.now().toString(36), exportedAt: new Date().toISOString() },
+            state: collectState(),
+          };
+        }
+        function downloadTransfer() {
+          const data = buildTransfer();
+          const d = new Date();
+          const pad = (n) => String(n).padStart(2, "0");
+          const fname = `ml-progress-${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}.json`;
+          const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+          const a = document.createElement("a");
+          a.href = URL.createObjectURL(blob); a.download = fname;
+          document.body.appendChild(a); a.click(); a.remove();
+          setTimeout(() => URL.revokeObjectURL(a.href), 4000);
+          toast("فایل انتقال پیشرفت دانلود شد؛ در مرورگر یا دستگاه دیگر همین صفحه را باز کن و از کارت «انتقال پیشرفت» همین فایل را وارد کن تا دقیقاً از همین‌جا ادامه بدهی.");
+          return fname;
+        }
+        /* ---------- merge helpers (dedupe-aware) ---------- */
+        const rowKey = (r) => JSON.stringify(r);
+        function unionRows(cur, inc) {
+          const out = Array.isArray(cur) ? [...cur] : [];
+          const seen = new Set(out.map(rowKey));
+          for (const r of Array.isArray(inc) ? inc : []) if (!seen.has(rowKey(r))) { seen.add(rowKey(r)); out.push(r); }
+          return out;
+        }
+        function unionIds(cur, inc) { return [...new Set([...(Array.isArray(cur) ? cur : []), ...(Array.isArray(inc) ? inc : [])])]; }
+        function mergeStampedMap(cur, inc, field) {
+          const out = { ...(cur && typeof cur === "object" ? cur : {}) };
+          for (const [id, row] of Object.entries(inc && typeof inc === "object" ? inc : {})) {
+            if (!(id in out)) { out[id] = row; continue; }
+            const ta = out[id] && out[id][field] ? Date.parse(out[id][field]) || 0 : 0;
+            const tb = row && row[field] ? Date.parse(row[field]) || 0 : 0;
+            if (tb > ta) out[id] = row;
+          }
+          return out;
+        }
+        function mergeTours(cur, inc) {
+          const out = { ...(cur && typeof cur === "object" ? cur : {}) };
+          for (const [id, row] of Object.entries(inc && typeof inc === "object" ? inc : {})) {
+            if (!(id in out)) { out[id] = row; continue; }
+            if ((row.updatedAt || 0) > (out[id].updatedAt || 0)) out[id] = row;
+          }
+          return out;
+        }
+        function mergeQState(cur, inc) {
+          const out = { ...(cur && typeof cur === "object" ? cur : {}) };
+          for (const [k, v] of Object.entries(inc && typeof inc === "object" ? inc : {})) {
+            if (!out[k]) { out[k] = v; continue; }
+            out[k] = {
+              answers: { ...(v.answers || {}), ...(out[k].answers || {}) },
+              hints: [...new Set([...(v.hints || []), ...(out[k].hints || [])])],
+              finished: !!(v.finished || out[k].finished),
+            };
+          }
+          return out;
+        }
+        function mergeGuide(cur, inc) {
+          const base = cur && typeof cur === "object" ? cur : { labOpened: false, errCounts: {}, lowQuizUnit: null, absenceShownFor: 0 };
+          const inn = inc && typeof inc === "object" ? inc : {};
+          const errs = { ...(base.errCounts || {}) };
+          for (const [k, v] of Object.entries(inn.errCounts || {})) errs[k] = Math.max(errs[k] || 0, v || 0);
+          return { ...base, labOpened: !!(base.labOpened || inn.labOpened), errCounts: errs, lowQuizUnit: base.lowQuizUnit ?? inn.lowQuizUnit ?? null };
+        }
+        function mergeQueue(cur, inc) {
+          const out = Array.isArray(cur) ? [...cur] : [];
+          const seen = new Set(out.map((r) => r && r.batch_id));
+          for (const r of Array.isArray(inc) ? inc : []) if (r && r.batch_id && !seen.has(r.batch_id)) { seen.add(r.batch_id); out.push(r); }
+          return out;
+        }
+        function teachHasText(v) { return !!(v && (String(v.c || "").trim() || String(v.e || "").trim() || String(v.t || "").trim())); }
+        function mergeValue(k, cur, inc) {
+          if (k === SUPA_QUEUE_KEY) return mergeQueue(cur, inc);
+          if (k === "mlshell.done" || k === "mlshell.quizseen" || k.startsWith("mlshell.jupyter.")) return unionIds(cur, inc);
+          if (k === "mlshell.rec.events" || k === "mlshell.rec.mistakes") return unionRows(cur, inc);
+          if (k === "mlshell.rec.dayProgress") return mergeStampedMap(cur, inc, "updatedAt");
+          if (k === "mlshell.rec.teachBacks") return mergeStampedMap(cur, inc, "timestamp");
+          if (k === "mlshell.tours") return mergeTours(cur, inc);
+          if (k === "mlshell.qstate") return mergeQState(cur, inc);
+          if (k === "mlshell.guide") return mergeGuide(cur, inc);
+          if (k.startsWith("mlshell.notebook.")) {
+            if (cur === undefined) return inc;
+            return (inc && (inc.updatedAt || 0)) > (cur.updatedAt || 0) ? inc : cur;
+          }
+          if (k.startsWith("mlshell.labdone.")) return !!(cur || inc);
+          if (k.startsWith("mlshell.teach.")) return teachHasText(cur) ? cur : (teachHasText(inc) ? inc : cur ?? inc);
+          return cur === undefined ? inc : cur;
+        }
+        function applyState(state) {
+          let applied = 0;
+          for (const [k, v] of Object.entries(state || {})) {
+            if (SKIP_KEYS.has(k)) continue;
+            if (!k.startsWith("mlshell.") && k !== SUPA_QUEUE_KEY) continue;
+            const merged = mergeValue(k, rawGet(k), v);
+            if (merged !== undefined) { store.set(k, merged); applied++; }
+          }
+          return applied;
+        }
+        /* ---------- accept the older Drive export (meta + tables) ---------- */
+        function stateFromTables(data) {
+          const t = data.tables || {};
+          const strip = (rows) => (Array.isArray(rows) ? rows : []).map((r) => { const c = { ...r }; delete c.source; delete c.exportId; return c; });
+          const state = {};
+          const dayMap = {}; const done = [];
+          strip(t.day_progress).forEach((r) => { dayMap[r.day] = r; if (r.status === "completed") done.push(r.day); });
+          state["mlshell.rec.dayProgress"] = dayMap;
+          if (done.length) state["mlshell.done"] = done;
+          state["mlshell.rec.events"] = strip(t.events);
+          state["mlshell.rec.mistakes"] = strip(t.mistakes);
+          const teach = {};
+          strip(t.teach_backs).forEach((r) => {
+            teach[r.day] = r;
+            if (r.sentences) state["mlshell.teach." + r.day] = { c: r.sentences.concept || "", e: r.sentences.example || "", t: r.sentences.trap || "" };
+          });
+          state["mlshell.rec.teachBacks"] = teach;
+          const tours = {};
+          strip(t.tour_progress).forEach((r) => { tours[r.tourId] = { status: r.status, step: r.step, updatedAt: r.updatedAt ? Date.parse(r.updatedAt) || 0 : 0 }; });
+          state["mlshell.tours"] = tours;
+          strip(t.lab_notebooks).forEach((r) => {
+            state["mlshell.notebook." + r.labDay] = {
+              cells: (Array.isArray(r.cells) ? r.cells : []).map((c, i) => ({ kind: (r.layout && r.layout[i] && r.layout[i].kind) || "orig", origIndex: r.layout && r.layout[i] && typeof r.layout[i].origIndex === "number" ? r.layout[i].origIndex : i, title: c.title, code: c.code })),
+              updatedAt: r.updatedAt ? Date.parse(r.updatedAt) || 0 : 0,
+            };
+          });
+          return state;
+        }
+        function summarize(state) {
+          const done = Array.isArray(state["mlshell.done"]) ? state["mlshell.done"].length : 0;
+          const ev = Array.isArray(state["mlshell.rec.events"]) ? state["mlshell.rec.events"].length : 0;
+          const mis = Array.isArray(state["mlshell.rec.mistakes"]) ? state["mlshell.rec.mistakes"].length : 0;
+          const nb = Object.keys(state).filter((k) => k.startsWith("mlshell.notebook.")).length;
+          const qs = state["mlshell.qstate"] && typeof state["mlshell.qstate"] === "object" ? Object.values(state["mlshell.qstate"]).reduce((n, s) => n + Object.keys((s && s.answers) || {}).length, 0) : 0;
+          return `در این فایل: ${faNum(done)} درس کامل‌شده، ${faNum(qs)} پاسخ آزمون و تمرین، ${faNum(ev)} رویداد، ${faNum(mis)} خطا و ${faNum(nb)} دفترچهٔ آزمایشگاه هست.`;
+        }
+        function parse(text) {
+          let data;
+          try { data = JSON.parse(text); } catch { return { error: "این فایل خوانا نیست؛ همان فایلی را انتخاب کن که از دکمهٔ «دانلود فایل انتقال پیشرفت» گرفته‌ای." }; }
+          if (data && data.format === FORMAT && data.state && typeof data.state === "object" && !Array.isArray(data.state)) {
+            return { state: data.state, meta: data.meta || {}, summaryText: summarize(data.state) };
+          }
+          if (data && data.tables && typeof data.tables === "object" && data.meta) {
+            const state = stateFromTables(data);
+            return { state, meta: data.meta, summaryText: summarize(state) + " (این فایل از نوع خروجی قدیمی درایو است؛ پاسخ‌های تکی آزمون و تمرین در آن نیست، ولی نمره‌ها، اشتباه‌ها و دفترچه‌ها بازیابی می‌شوند.)" };
+          }
+          return { error: "این فایل، فایل پیشرفت این دوره نیست؛ فایل انتقال پیشرفت یا فایل خروجی پیشرفت را انتخاب کن." };
+        }
+        function importState(state) {
+          const applied = applyState(state);
+          /* force a fresh full snapshot to the teacher from this device */
+          store.del("mlshell.supabase.lastHash");
+          Recorder.event("progress_import", { value: String(applied) });
+          SupaSync.syncNow();
+          return applied;
+        }
+        return { buildTransfer, downloadTransfer, parse, importState, summarize };
+      })();
+
       /* ================= local progress (this browser only) ================= */
       const Progress = {
         doneSet() { return new Set(store.get("mlshell.done", [])); },
@@ -1426,6 +1632,23 @@
             <button type="button" class="btn" id="dash-cap">باز کردن فضای آزمایشگاهی تکلیف پایانی</button>
           </div>
           <div class="card">
+            <h2 class="sec">انتقال پیشرفت به مرورگر یا دستگاه دیگر</h2>
+            <p>پیشرفتت فقط در این مرورگر گیر نکرده است. اگر مرورگر یا دستگاهت را عوض کردی، لازم نیست از اول شروع کنی: از این‌جا <strong>فایل انتقال پیشرفت</strong> را دانلود کن، آن را با خودت ببر (پیام‌رسان، ایمیل یا درایو)، در مرورگر یا دستگاه تازه همین صفحه را باز کن و از همین کارت آن فایل را <strong>وارد</strong> کن؛ دقیقاً از همان‌جا ادامه می‌دهی — درس‌های کامل‌شده، پاسخ‌های آزمون و تمرین و نمره‌هایشان، اشتباه‌ها، آموزش‌های برگشتی و دفترچه‌های آزمایشگاه همه برمی‌گردند.</p>
+            <p>وارد کردن، پیشرفت فایل را با پیشرفت همین مرورگر <strong>ادغام</strong> می‌کند، نه جایگزین: هیچ رکوردی دوبار شمرده نمی‌شود و اگر در هر دو جا کاری کرده باشی، هیچ‌کدام از دست نمی‌رود. بسته‌هایی هم که هنوز به استاد نرسیده‌اند و در صف مانده‌اند، داخل همین فایل سفر می‌کنند و از دستگاه تازه ارسال می‌شوند. این فایل فقط پیشرفت خودت است و هیچ رمز یا کلید محرمانه‌ای ندارد.</p>
+            <div class="kbd-row" style="margin-top:4px">
+              <button type="button" class="btn primary" id="dash-transfer">دانلود فایل انتقال پیشرفت</button>
+              <button type="button" class="btn" id="dash-import-btn">وارد کردن فایل پیشرفت</button>
+              <input type="file" id="dash-import-file" accept=".json,application/json" class="hidden" tabindex="-1" aria-hidden="true">
+            </div>
+            ${pendingTransferImport ? `<div class="callout key" style="margin-top:10px">
+              <strong>فایل پیشرفت خوانده شد.</strong> ${esc(pendingTransferImport.summaryText)} با زدن دکمهٔ زیر، این پیشرفت با پیشرفت همین مرورگر ادغام می‌شود و بعد از آن خودکار برای استاد هم ارسال می‌شود.
+              <div class="kbd-row" style="margin-top:8px">
+                <button type="button" class="btn primary" id="dash-import-confirm">بازیابی پیشرفت از این فایل</button>
+                <button type="button" class="btn" id="dash-import-cancel">لغو</button>
+              </div>
+            </div>` : ""}
+          </div>
+          <div class="card">
             <h2 class="sec">خروجی پیشرفت برای درایو</h2>
             <p>همهٔ فعالیتت در این پوسته — باز کردن درس‌ها و میزان خواندن هر درس، پاسخ‌های آزمون و تمرین و نمره‌هایشان، اجراها و خطاهای آزمایشگاه، کد و چیدمان دفترچه‌ها، آموزش‌های برگشتی و پیشرفت تورها — با همان جدول‌هایی که سایت اصلی ثبت می‌کند، در همین مرورگر ثبت می‌شود و به‌صورت خودکار برای استاد هم ارسال می‌شود. این پوسته خودش مستقیم به درایو وصل نمی‌شود؛ فایل خروجی زیر، مسیر پشتیبان انتقال از راه درایو است.</p>
             <p><strong>روزی ۲ بار</strong> (مثلاً صبح و شب) دکمهٔ زیر را بزن تا فایل <span class="mono" dir="ltr">shell-export-YYYYMMDD-HHMM.json</span> دانلود شود؛ بعد همان فایل را در پوشهٔ <strong>«ورودی-پوسته»</strong> داخل پوشهٔ <strong>«دیتابیس پوسته دانشجویی دوره یادگیری ماشین»</strong> در درایو بارگذاری کن. از همان‌جا مرحلهٔ انتقال به سایت اصلی آغاز می‌شود: Muse فایل را از درایو می‌خواند و رکوردها و خطاهایت را به سایت اصلی وارد می‌کند. ثبت رسمی پیشرفت و نمره در سایت اصلی است؛ فعالیتت علاوه بر ثبت در همین مرورگر، به‌صورت خودکار هم برای استاد ارسال می‌شود و این فایل، پشتیبان همان انتقال است.</p>
@@ -1443,6 +1666,33 @@
         if (nb && focus) nb.addEventListener("click", () => go({ view: "lesson", unit: focus.id, tab: "lesson" }));
         document.getElementById("dash-cap").addEventListener("click", () => go({ view: "capstone" }));
         document.getElementById("dash-export").addEventListener("click", () => Recorder.downloadExport());
+        const transferBtn = document.getElementById("dash-transfer");
+        if (transferBtn) transferBtn.addEventListener("click", () => ProgressTransfer.downloadTransfer());
+        const importBtn = document.getElementById("dash-import-btn");
+        const importFile = document.getElementById("dash-import-file");
+        if (importBtn && importFile) importBtn.addEventListener("click", () => importFile.click());
+        if (importFile) importFile.addEventListener("change", async () => {
+          const f = importFile.files && importFile.files[0];
+          if (!f) return;
+          try {
+            const parsed = ProgressTransfer.parse(await f.text());
+            if (parsed.error) { toast(parsed.error); }
+            else { pendingTransferImport = parsed; render(); toast("فایل پیشرفت خوانده شد؛ برای کامل‌شدن بازیابی، دکمهٔ «بازیابی پیشرفت از این فایل» را در کارت انتقال پیشرفت بزن."); }
+          } catch { toast("خواندن فایل نشد؛ دوباره تلاش کن."); }
+          importFile.value = "";
+        });
+        const importConfirm = document.getElementById("dash-import-confirm");
+        if (importConfirm) importConfirm.addEventListener("click", () => {
+          const p = pendingTransferImport;
+          pendingTransferImport = null;
+          if (p) {
+            ProgressTransfer.importState(p.state);
+            toast("پیشرفتت بازیابی شد؛ دقیقاً از همان‌جا ادامه بده. هرچه هنوز به استاد نرسیده باشد، خودکار ارسال می‌شود و اگر شبکه نرسد در صف می‌ماند.");
+          }
+          render();
+        });
+        const importCancel = document.getElementById("dash-import-cancel");
+        if (importCancel) importCancel.addEventListener("click", () => { pendingTransferImport = null; render(); });
         const syncBtn = document.getElementById("dash-sync");
         if (syncBtn) syncBtn.addEventListener("click", async () => {
           syncBtn.disabled = true;
@@ -1592,12 +1842,31 @@
         return "";
       }
 
-      /* ---- in-memory per-lesson question state (never persisted) ---- */
+      /* ---- per-lesson question state, persisted in this browser ----
+         Answers and hints are stored under «mlshell.qstate» so a reload
+         keeps them, and so the progress-transfer file (ProgressTransfer
+         below) carries quiz and exercise answers to another browser or
+         device — restoring them there re-renders the same answered
+         cards without re-firing the recorder, so nothing is counted
+         twice. */
       const qState = new Map(); // key `${unit}:${kind}` -> {answers:{}, hints:Set, finished:bool}
       function getQState(unit, kind, n) {
         const k = unit + ":" + kind;
-        if (!qState.has(k)) qState.set(k, { answers: {}, hints: new Set(), finished: false });
+        if (!qState.has(k)) {
+          const saved = store.get("mlshell.qstate", {})[k];
+          qState.set(k, saved && typeof saved === "object"
+            ? { answers: saved.answers || {}, hints: new Set(Array.isArray(saved.hints) ? saved.hints : []), finished: !!saved.finished }
+            : { answers: {}, hints: new Set(), finished: false });
+        }
         return qState.get(k);
+      }
+      function saveQState(unit, kind) {
+        const k = unit + ":" + kind;
+        const st = qState.get(k);
+        if (!st) return;
+        const all = store.get("mlshell.qstate", {});
+        all[k] = { answers: st.answers, hints: [...st.hints], finished: st.finished };
+        store.set("mlshell.qstate", all);
       }
       function questionCard(item, idx, st, kind) {
         const chosen = st.answers[idx];
@@ -1637,6 +1906,7 @@
           st.answers[idx] = Number(b.dataset.opt);
           if (Object.keys(st.answers).length === items.length) st.finished = true;
           const scoreNow = items.reduce((s, it, i) => s + (st.answers[i] === it.answer ? 1 : 0), 0);
+          saveQState(unit, kind);
           Recorder.answer({ day: unit, kind, item: items[idx], index: idx, chosenIdx: st.answers[idx], score: scoreNow, total: items.length, finished: st.finished });
           onDone();
         }));
@@ -1645,6 +1915,7 @@
           const hintIdx = Number(b.dataset.hint);
           if (!st.hints.has(hintIdx)) Recorder.hint(unit, kind, hintIdx);
           st.hints.add(hintIdx);
+          saveQState(unit, kind);
           onDone(true);
         }));
       }
