@@ -686,7 +686,34 @@
       @media (prefers-color-scheme: dark) { .videofacade .play-ic { color: #04130c; } }
       .videofacade .vf-title { font-weight: 800; direction: ltr; font-size: 0.95rem; }
       .videoframe { width: 100%; aspect-ratio: 16 / 9; border: 0; border-radius: var(--radius); background: #000; display: block; }
-      .cues { max-height: 300px; overflow-y: auto; border: 1px solid var(--border); border-radius: var(--radius-lg); margin-top: 10px; }
+      .videowrap { position: relative; width: 100%; }
+      .videowrap:fullscreen { background: #000; display: flex; align-items: center; justify-content: center; }
+      .videowrap:fullscreen .videoframe { height: 100%; }
+      .subtitle-overlay {
+        position: absolute; inset-inline: 4%; bottom: 10%; z-index: 3;
+        display: flex; justify-content: center; pointer-events: none;
+      }
+      .subtitle-overlay[hidden] { display: none; }
+      .subtitle-overlay span {
+        background: rgba(0, 0, 0, 0.8); color: #fff;
+        padding: 4px 14px; border-radius: 6px;
+        font-size: clamp(0.95rem, 2.6vw, 1.3rem); font-weight: 700; line-height: 1.9;
+        text-align: center; max-width: 100%;
+      }
+      .videowrap:fullscreen .subtitle-overlay span { font-size: clamp(1.2rem, 3.2vw, 2rem); }
+      .fs-btn {
+        position: absolute; top: 8px; inset-inline-end: 8px; z-index: 4;
+        background: rgba(0, 0, 0, 0.65); color: #fff; border: 1px solid rgba(255, 255, 255, 0.35);
+        border-radius: 8px; padding: 5px 12px; font-size: 0.82rem; font-weight: 700; cursor: pointer;
+      }
+      .fs-btn:hover { background: rgba(0, 0, 0, 0.85); }
+      .cues-wrap { margin-top: 10px; }
+      .cues-wrap > summary {
+        cursor: pointer; font-weight: 700; font-size: 0.92rem; color: var(--dim);
+        padding: 8px 2px;
+      }
+      .cues { max-height: 300px; overflow-y: auto; border: 1px solid var(--border); border-radius: var(--radius-lg); margin-top: 6px; }
+      .cue[data-seek] { cursor: pointer; }
       .cue { padding: 7px 14px; border-bottom: 1px solid var(--border); font-size: 0.93rem; display: flex; gap: 10px; align-items: baseline; }
       .cue:last-child { border-bottom: 0; }
       .cue .cue-t { color: var(--dim); font-size: 0.78rem; flex: 0 0 auto; direction: ltr; }
@@ -2246,11 +2273,14 @@
             <button type="button" class="videofacade" data-play="${v.key}" aria-label="پخش ویدیوی کمکی ${esc(v.title)}">
               <span class="play-ic">${ICONS.play}</span>
               <span class="vf-title">${esc(v.title)}</span>
-              <span class="small">برای پخش، این‌جا بزن — ویدیو از یوتیوب پخش می‌شود و زیرنویس فارسی زیرش هم‌زمان می‌آید.</span>
+              <span class="small">برای پخش، این‌جا بزن — ویدیو از یوتیوب پخش می‌شود و زیرنویس فارسی روی خود ویدیو می‌آید.</span>
             </button>
           </div>
-          <div class="cues" aria-label="زیرنویس فارسی ویدیو">${cues}</div>
-          <p class="small dim" style="margin-bottom:0">اگر پخش این‌جا نشد، <a href="${esc(v.watchUrl)}" target="_blank" rel="noopener">ویدیو را در یوتیوب ببین</a> و زیرنویس فارسی بالا را همراهش بخوان.</p>
+          <details class="cues-wrap">
+            <summary>متن کامل زیرنویس فارسی — برای خواندن یا پیدا کردن یک جمله (زیرنویس هنگام پخش، روی خود ویدیو می‌آید)</summary>
+            <div class="cues" aria-label="متن کامل زیرنویس فارسی ویدیو">${cues}</div>
+          </details>
+          <p class="small dim" style="margin-bottom:0">اگر پخش این‌جا نشد، <a href="${esc(v.watchUrl)}" target="_blank" rel="noopener">ویدیو را در یوتیوب ببین</a> و متن کامل زیرنویس فارسی همین کارت را همراهش بخوان.</p>
         </section>`;
       }
       function wireVideo(card, v) {
@@ -2262,8 +2292,26 @@
           slot.innerHTML = `<p class="dim" role="status">در حال آماده‌سازی پخش‌کننده…</p>`;
           try {
             await loadYtApi();
+            const wrap = document.createElement("div");
+            wrap.className = "videowrap";
             const holder = document.createElement("div");
-            slot.innerHTML = ""; slot.appendChild(holder);
+            const overlay = document.createElement("div");
+            overlay.className = "subtitle-overlay";
+            overlay.setAttribute("aria-live", "polite");
+            overlay.hidden = true;
+            const overlayText = document.createElement("span");
+            overlay.appendChild(overlayText);
+            const fsBtn = document.createElement("button");
+            fsBtn.type = "button";
+            fsBtn.className = "fs-btn";
+            fsBtn.textContent = "تمام‌صفحه";
+            fsBtn.setAttribute("aria-label", "تمام‌صفحه کردن ویدیو همراه زیرنویس");
+            fsBtn.addEventListener("click", () => {
+              if (document.fullscreenElement) { document.exitFullscreen().catch(() => {}); }
+              else if (wrap.requestFullscreen) { wrap.requestFullscreen().catch(() => {}); }
+            });
+            wrap.append(holder, overlay, fsBtn);
+            slot.innerHTML = ""; slot.appendChild(wrap);
             const startAt = Math.floor(v.sectionStart || 0);
             const player = new YT.Player(holder, {
               videoId: v.youtubeId,
@@ -2275,24 +2323,39 @@
             });
             const holderEl = holder;
             holderEl.classList.add("videoframe");
+            const cuesWrap = card.querySelector(".cues-wrap");
             const cuesEl = card.querySelector(".cues");
             const cueEls = [...card.querySelectorAll("[data-cue]")];
+            cueEls.forEach((ce) => {
+              ce.dataset.seek = "1";
+              ce.title = "رفتن به این جمله در ویدیو";
+              ce.addEventListener("click", () => {
+                const c = v.cues[Number(ce.dataset.cue)];
+                if (c && player && typeof player.seekTo === "function") { try { player.seekTo(c.start, true); player.playVideo(); } catch { /* noop */ } }
+              });
+            });
+            let lastNow = -2;
             setInterval(() => {
               if (!player || typeof player.getCurrentTime !== "function") return;
               let t; try { t = player.getCurrentTime(); } catch { return; }
-              if (v.sectionEnd && t >= v.sectionEnd) { try { player.pauseVideo(); } catch { /* noop */ } return; }
-              if (v.sectionStart && t < v.sectionStart - 0.5) { try { player.seekTo(v.sectionStart, true); } catch { /* noop */ } return; }
+              if (v.sectionEnd && t >= v.sectionEnd) { try { player.pauseVideo(); } catch { /* noop */ } }
+              if (v.sectionStart && t < v.sectionStart - 0.5) { try { player.seekTo(v.sectionStart, true); } catch { /* noop */ } }
               let now = -1;
               v.cues.forEach((c, i) => { if (t >= c.start && t < c.end) now = i; });
+              if (now !== lastNow) {
+                lastNow = now;
+                if (now >= 0) { overlayText.textContent = v.cues[now].lines.join(" "); overlay.hidden = false; }
+                else overlay.hidden = true;
+              }
               cueEls.forEach((ce, i) => ce.classList.toggle("now", i === now));
-              if (now >= 0 && cueEls[now]) {
+              if (now >= 0 && cueEls[now] && cuesWrap && cuesWrap.open) {
                 const target = cueEls[now];
                 const r = target.offsetTop - cuesEl.scrollTop;
                 if (r < 0 || r > cuesEl.clientHeight - 60) cuesEl.scrollTop = target.offsetTop - 30;
               }
             }, 300);
           } catch {
-            slot.innerHTML = `<div class="feedback bad">پخش‌کننده بارگذاری نشد (احتمالاً اینترنت یا یوتیوب در دسترس نیست). <a href="${esc(v.watchUrl)}" target="_blank" rel="noopener">ویدیو را در یوتیوب ببین</a> و زیرنویس فارسی پایین را همراهش بخوان.</div>`;
+            slot.innerHTML = `<div class="feedback bad">پخش‌کننده بارگذاری نشد (احتمالاً اینترنت یا یوتیوب در دسترس نیست). <a href="${esc(v.watchUrl)}" target="_blank" rel="noopener">ویدیو را در یوتیوب ببین</a> و متن کامل زیرنویس فارسی همین کارت را همراهش بخوان.</div>`;
           }
         });
       }
