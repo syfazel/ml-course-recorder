@@ -812,18 +812,21 @@
          tour_progress, lab_notebooks. Everything is recorded in this
          browser's localStorage AND sent automatically to the teacher's
          Supabase recorder (see the SupaSync block below: offline-queued,
-         and the local keys are never removed). The shell never writes to
-         Drive itself and carries no Drive token or credential of any kind; the
-         student carries the record to Drive with the export button
-         (a downloaded JSON file uploaded to «ورودی-پوسته»), and from
-         there Muse reads it and imports it into the main site.
+         and the local keys are never removed). The page carries no Drive
+         credential of any kind baked in; Drive saving is opt-in and runs
+         only with the student's own Google consent (see the DriveSync
+         block below: their Drive, their token, held only in the tab's
+         session). Without that consent, the student can still carry the
+         record to Drive with the export button (a downloaded JSON file
+         uploaded to «ورودی-پوسته»), and from there Muse reads it and
+         imports it into the main site.
          Official scores/progress live on the main site after that
          import; these local rows are the transfer record. */
       const SHELL_VERSION = "1.2.0";
       /* SupaSync is defined right after the Recorder; this notifier lets
          recorder writes schedule a Supabase send without depending on
          load order (early calls, before that block runs, are ignored). */
-      function notifyRecorderChanged() { try { SupaSync.schedule(); } catch { /* sync block not evaluated yet */ } }
+      function notifyRecorderChanged() { try { SupaSync.schedule(); } catch { /* sync block not evaluated yet */ } try { DriveSync.notifyChanged(); } catch { /* drive block not evaluated yet */ } }
       const Recorder = (() => {
         const K = { day: "mlshell.rec.dayProgress", events: "mlshell.rec.events", mistakes: "mlshell.rec.mistakes", teach: "mlshell.rec.teachBacks" };
         let memSession = null;
@@ -1339,6 +1342,245 @@
         return { buildTransfer, downloadTransfer, parse, importState, summarize };
       })();
 
+      /* ================= Google Drive sync (with the student's own consent) =================
+         How it works, in the student's own words as shown on the
+         dashboard card:
+           1. The student taps «اتصال درایو و دادن اجازه» and signs in
+              with THEIR OWN Google account in Google's own consent
+              popup (Google Identity Services, scope drive.file only —
+              this page can only touch files it creates itself, never
+              the rest of the student's Drive).
+           2. Every recorded change (the same six recorder tables that
+              cover lessons, quizzes, exercises, labs, mistakes,
+              teach-backs and tour/guide progress) is then saved
+              automatically into a folder in the STUDENT's Drive:
+              «پیشرفت دوره یادگیری ماشین».
+           3. At the end of each day the latest snapshot is copied
+              into a second folder the student shares from their own
+              Drive («ورودی استاد — پیشرفت دوره یادگیری ماشین») and
+              that folder is given a read link the student can hand to
+              the teacher, so the teacher can bring the file in.
+           4. «آوردن فایل‌های تازه» lists that shared folder, and any
+              file not seen before is downloaded and merged with the
+              exact same dedupe-aware import as the progress-transfer
+              card — nothing is ever counted twice.
+         Honest limits of a static page, stated on the card too: a web
+         page cannot run while the browser is closed, so the
+         end-of-day step fires at the last moments the page is open
+         that day AND again on the first open of the next day; and a
+         page can never write into the TEACHER's Drive without the
+         teacher's own permission, which is why the shared folder in
+         the student's Drive (with its read link) is the bridge.
+         SETUP STEP (one time, by the teacher — deliberately NOT a
+         fake value): this page ships with NO secret of any kind. The
+         only thing Drive needs is a Google OAuth 2.0 Web Client ID,
+         which is a public identifier, not a secret. Until the teacher
+         creates one in Google Cloud Console (APIs & Services →
+         Credentials → OAuth client ID → Web application, with this
+         page's address as an authorized JavaScript origin and the
+         Google Drive API enabled) and pastes it into
+         GOOGLE_OAUTH_CLIENT_ID below, the connect button explains
+         this setup step instead of pretending to connect. The access
+         token itself is kept ONLY in this tab's sessionStorage —
+         never in localStorage, never in any export file — and dies
+         with the browser session. */
+      const GOOGLE_OAUTH_CLIENT_ID = ""; /* ← قدم راه‌اندازی: شناسهٔ کاربری OAuth گوگل (وب) را استاد این‌جا می‌گذارد؛ شناسه، عمومی است و رمز نیست */
+      const DriveSync = (() => {
+        const STATE_KEY = "mlshell.drive.state";
+        const TOKEN_KEY = "mlshell.drive.token";
+        const FOLDER_NAME = "پیشرفت دوره یادگیری ماشین";
+        const SHARED_FOLDER_NAME = "ورودی استاد — پیشرفت دوره یادگیری ماشین";
+        const SCOPE = "https://www.googleapis.com/auth/drive.file";
+        let tokenClient = null;
+        let gisPromise = null;
+        let saveTimer = null;
+        let dayTimer = null;
+        let tokenWaiter = null;
+        const pad = (n) => String(n).padStart(2, "0");
+        function todayKey(d = new Date()) { return `${d.getFullYear()}-${pad(d.getMonth() + 1)}${pad(d.getDate())}`; }
+        function state() { return store.get(STATE_KEY, { consent: false, folderId: null, sharedFolderId: null, sharedLink: "", fileId: null, fileName: "", lastSaveAt: null, lastSaveDate: "", lastShareDate: "", lastFetchAt: null, seenFiles: [], lastError: "" }); }
+        function saveState(patch) { const s = { ...state(), ...patch }; store.set(STATE_KEY, s); return s; }
+        function getToken() { try { return sessionStorage.getItem(TOKEN_KEY) || ""; } catch { return ""; } }
+        function setToken(t) { try { if (t) sessionStorage.setItem(TOKEN_KEY, t); else sessionStorage.removeItem(TOKEN_KEY); } catch { /* ignore */ } }
+        function configured() { return !!GOOGLE_OAUTH_CLIENT_ID; }
+        function connected() { return !!getToken(); }
+        function loadGis() {
+          if (window.google && window.google.accounts && window.google.accounts.oauth2) return Promise.resolve(true);
+          if (gisPromise) return gisPromise;
+          gisPromise = new Promise((resolve) => {
+            const s = document.createElement("script");
+            s.src = "https://accounts.google.com/gsi/client";
+            s.async = true; s.defer = true;
+            s.onload = () => resolve(!!(window.google && window.google.accounts && window.google.accounts.oauth2));
+            s.onerror = () => resolve(false);
+            document.head.appendChild(s);
+          });
+          return gisPromise;
+        }
+        async function connect(interactive = true) {
+          if (!configured()) return { ok: false, error: "not_configured" };
+          const ok = await loadGis();
+          if (!ok) { saveState({ lastError: "gis_load_failed" }); return { ok: false, error: "gis_load_failed" }; }
+          if (!tokenClient) {
+            tokenClient = window.google.accounts.oauth2.initTokenClient({
+              client_id: GOOGLE_OAUTH_CLIENT_ID,
+              scope: SCOPE,
+              callback: (resp) => {
+                const w = tokenWaiter; tokenWaiter = null;
+                if (resp && resp.access_token) { setToken(resp.access_token); saveState({ consent: true, lastError: "" }); if (w) w({ ok: true }); }
+                else { saveState({ lastError: "consent_denied" }); if (w) w({ ok: false, error: "consent_denied" }); }
+              },
+              error_callback: () => { const w = tokenWaiter; tokenWaiter = null; saveState({ lastError: "consent_error" }); if (w) w({ ok: false, error: "consent_error" }); },
+            });
+          }
+          return new Promise((resolve) => {
+            tokenWaiter = resolve;
+            try { tokenClient.requestAccessToken({ prompt: interactive ? "consent" : "" }); }
+            catch { tokenWaiter = null; resolve({ ok: false, error: "consent_error" }); }
+          });
+        }
+        async function api(path, opts = {}) {
+          const res = await fetch("https://www.googleapis.com/drive/v3/" + path, { ...opts, headers: { "Authorization": "Bearer " + getToken(), ...(opts.headers || {}) } });
+          if (res.status === 401) { setToken(""); saveState({ lastError: "token_expired" }); throw new Error("token_expired"); }
+          if (!res.ok) throw new Error("drive_http_" + res.status);
+          return res.status === 204 ? null : res.json();
+        }
+        const qEsc = (s) => s.replace(/'/g, "\\'");
+        async function findFolder(name) {
+          const q = encodeURIComponent(`name='${qEsc(name)}' and mimeType='application/vnd.google-apps.folder' and trashed=false`);
+          const r = await api(`files?q=${q}&fields=files(id,name)&spaces=drive`);
+          return r && r.files && r.files.length ? r.files[0].id : null;
+        }
+        async function ensureFolder(name, key) {
+          const s = state();
+          if (s[key]) return s[key];
+          let id = await findFolder(name);
+          if (!id) {
+            const r = await api("files?fields=id", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name, mimeType: "application/vnd.google-apps.folder" }) });
+            id = r.id;
+          }
+          saveState({ [key]: id });
+          return id;
+        }
+        async function findFile(folderId, name) {
+          const q = encodeURIComponent(`name='${qEsc(name)}' and '${folderId}' in parents and trashed=false`);
+          const r = await api(`files?q=${q}&fields=files(id,name,webViewLink)&spaces=drive`);
+          return r && r.files && r.files.length ? r.files[0] : null;
+        }
+        async function uploadJson(folderId, name, content, existingId) {
+          const boundary = "mlshell" + Date.now().toString(36);
+          const meta = existingId ? { name } : { name, mimeType: "application/json", parents: [folderId] };
+          const body = `--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${JSON.stringify(meta)}\r\n--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${content}\r\n--${boundary}--`;
+          const url = existingId
+            ? `https://www.googleapis.com/upload/drive/v3/files/${existingId}?uploadType=multipart&fields=id,name,webViewLink`
+            : `https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name,webViewLink`;
+          const res = await fetch(url, { method: existingId ? "PATCH" : "POST", headers: { "Authorization": "Bearer " + getToken(), "Content-Type": "multipart/related; boundary=" + boundary }, body });
+          if (res.status === 401) { setToken(""); saveState({ lastError: "token_expired" }); throw new Error("token_expired"); }
+          if (!res.ok) throw new Error("drive_http_" + res.status);
+          return res.json();
+        }
+        /* save the full six-table snapshot of ALL sections to the student's own Drive folder */
+        async function saveNow() {
+          if (!connected()) return { ok: false, error: "not_connected" };
+          try {
+            const folderId = await ensureFolder(FOLDER_NAME, "folderId");
+            const data = Recorder.buildExport();
+            const d = new Date();
+            const fname = `shell-export-${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}.json`;
+            const prev = state();
+            const existing = prev.fileName === fname && prev.fileId ? { id: prev.fileId } : await findFile(folderId, fname);
+            const saved = await uploadJson(folderId, fname, JSON.stringify(data, null, 2), existing ? existing.id : null);
+            saveState({ fileId: saved.id, fileName: fname, lastSaveAt: new Date().toISOString(), lastSaveDate: todayKey(), lastError: "" });
+            return { ok: true, fileId: saved.id, fileName: fname };
+          } catch (e) { saveState({ lastError: String(e && e.message || e) }); return { ok: false, error: String(e && e.message || e) }; }
+        }
+        /* copy the latest snapshot into the shared folder and make the folder readable by link */
+        async function shareWithTeacher() {
+          if (!connected()) return { ok: false, error: "not_connected" };
+          try {
+            let s = state();
+            if (!s.fileId || s.lastSaveDate !== todayKey()) { const r = await saveNow(); if (!r.ok) return r; s = state(); }
+            const sharedId = await ensureFolder(SHARED_FOLDER_NAME, "sharedFolderId");
+            const already = await findFile(sharedId, s.fileName);
+            let link = state().sharedLink;
+            if (!already) await api(`files/${s.fileId}/copy?fields=id`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ parents: [sharedId] }) });
+            if (!link) {
+              await api(`files/${sharedId}/permissions?fields=id`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ type: "anyone", role: "reader" }) });
+              const f = await api(`files/${sharedId}?fields=webViewLink`);
+              link = (f && f.webViewLink) || "";
+              saveState({ sharedLink: link });
+            }
+            saveState({ lastShareDate: todayKey(), lastError: "" });
+            return { ok: true, link };
+          } catch (e) { saveState({ lastError: String(e && e.message || e) }); return { ok: false, error: String(e && e.message || e) }; }
+        }
+        /* bring in: download every not-yet-seen JSON in the shared folder and merge it, dedupe-aware */
+        async function fetchNewFromShared() {
+          if (!connected()) return { ok: false, error: "not_connected" };
+          try {
+            const sharedId = await ensureFolder(SHARED_FOLDER_NAME, "sharedFolderId");
+            const q = encodeURIComponent(`'${sharedId}' in parents and trashed=false and mimeType='application/json'`);
+            const r = await api(`files?q=${q}&fields=files(id,name,modifiedTime)&orderBy=modifiedTime&spaces=drive`);
+            const s = state();
+            const seen = new Set(s.seenFiles || []);
+            let brought = 0;
+            for (const f of (r && r.files) || []) {
+              if (seen.has(f.id)) continue;
+              const res = await fetch(`https://www.googleapis.com/drive/v3/files/${f.id}?alt=media`, { headers: { "Authorization": "Bearer " + getToken() } });
+              if (!res.ok) continue;
+              const parsed = ProgressTransfer.parse(await res.text());
+              seen.add(f.id);
+              if (!parsed.error) { ProgressTransfer.importState(parsed.state); brought++; }
+            }
+            saveState({ seenFiles: [...seen], lastFetchAt: new Date().toISOString(), lastError: "" });
+            return { ok: true, brought };
+          } catch (e) { saveState({ lastError: String(e && e.message || e) }); return { ok: false, error: String(e && e.message || e) }; }
+        }
+        /* recorder hook: while connected, debounce-save every change to the student's Drive */
+        function notifyChanged() {
+          if (!connected() || !state().consent) return;
+          if (saveTimer) clearTimeout(saveTimer);
+          saveTimer = setTimeout(() => { saveNow(); }, 45000);
+        }
+        /* end-of-day: at 23:55 while the page is open, and again on the
+           first open of a new day — save, then send to the shared folder */
+        async function endOfDayPass() {
+          if (!connected() || !state().consent) return;
+          const s = state();
+          if (s.lastShareDate === todayKey()) return;
+          await saveNow();
+          await shareWithTeacher();
+        }
+        function msUntilEndOfDay() {
+          const n = new Date(); const end = new Date(n.getFullYear(), n.getMonth(), n.getDate(), 23, 55, 0);
+          return Math.max(60000, end - n);
+        }
+        function boot() {
+          const s = state();
+          if (s.consent && s.lastSaveDate && s.lastSaveDate !== todayKey()) endOfDayPass();
+          if (dayTimer) clearTimeout(dayTimer);
+          dayTimer = setTimeout(() => { endOfDayPass(); boot(); }, msUntilEndOfDay());
+        }
+        function disconnect() {
+          const t = getToken();
+          if (t && window.google && window.google.accounts && window.google.accounts.oauth2) { try { window.google.accounts.oauth2.revoke(t, () => {}); } catch { /* ignore */ } }
+          setToken("");
+          saveState({ consent: false });
+        }
+        function statusText() {
+          const s = state();
+          if (!configured()) return "هنوز راه‌اندازی نشده است: قدم راه‌اندازی پایین همین کارت را ببین.";
+          if (!connected()) return s.consent ? "اجازه قبلاً داده شده است؛ برای این نشست مرورگر، یک بار روی «اتصال درایو» بزن تا ذخیرهٔ خودکار از سر گرفته شود." : "هنوز متصل نشده است.";
+          const parts = ["متصل است و ذخیرهٔ خودکار در درایو تو فعال است."];
+          if (s.lastSaveAt) parts.push(`آخرین ذخیره در درایو: ${new Date(s.lastSaveAt).toLocaleString("fa-IR")}`);
+          if (s.lastShareDate === todayKey()) parts.push("ارسال پایان امروز به پوشهٔ مشترک استاد انجام شده است.");
+          if (s.lastFetchAt) parts.push(`آخرین آوردن از پوشهٔ مشترک: ${new Date(s.lastFetchAt).toLocaleString("fa-IR")}`);
+          if (s.lastError === "token_expired") parts.push("اجازهٔ نشست قبل تمام شده بود؛ دوباره روی «اتصال درایو» بزن.");
+          return parts.join(" ");
+        }
+        return { configured, connected, connect, saveNow, shareWithTeacher, fetchNewFromShared, notifyChanged, endOfDayPass, boot, disconnect, statusText, state };
+      })();
+
       /* ================= local progress (this browser only) ================= */
       const Progress = {
         doneSet() { return new Set(store.get("mlshell.done", [])); },
@@ -1649,8 +1891,32 @@
             </div>` : ""}
           </div>
           <div class="card">
+            <h2 class="sec">ذخیره در درایوِ تو و ارسال خودکار روزانه برای استاد</h2>
+            <p>اگر اجازه بدهی، پیشرفتت به‌جای این‌که فقط در این مرورگر بماند، در <strong>درایو خودت</strong> ذخیره می‌شود و پایان هر روز خودش برای استاد می‌رود. این اتصال برای <strong>همهٔ بخش‌ها</strong> است: درس‌ها و میزان خواندنشان، آزمون‌ها و تمرین‌ها و نمره‌هایشان، آزمایشگاه‌ها و دفترچه‌ها، اشتباه‌ها، آموزش‌های برگشتی و پیشرفت راهنما — همان شش جدول کاملی که در خروجی پیشرفت هم هست.</p>
+            <p><strong>چطور کار می‌کند؟</strong></p>
+            <ul style="margin:6px 0; padding-inline-start:22px">
+              <li><strong>قدم ۱ ـ اجازهٔ خودت:</strong> روی دکمهٔ «اتصال درایو و دادن اجازه» می‌زنی و در پنجرهٔ رسمی گوگل با <strong>حساب گوگل خودت</strong> وارد می‌شوی و اجازه می‌دهی. این صفحه فقط به فایل‌هایی دسترسی دارد که خودش می‌سازد؛ بقیهٔ درایوت را نه می‌بیند و نه دست می‌زند. هیچ رمز یا کلید محرمانه‌ای در این صفحه نیست و رمز حسابت هم هرگز به این صفحه نمی‌رسد.</li>
+              <li><strong>قدم ۲ ـ ذخیره در درایو تو:</strong> از آن لحظه، هر تغییری در پیشرفتت خودکار در پوشهٔ «پیشرفت دوره یادگیری ماشین» در درایو خودت ذخیره می‌شود؛ هر وقت خواستی با دکمهٔ «ذخیرهٔ الان در درایو» همان لحظه هم می‌توانی ذخیره کنی.</li>
+              <li><strong>قدم ۳ ـ پایان هر روز، خودکار برای استاد:</strong> پایان هر روز، تازه‌ترین فایل پیشرفتت خودکار در پوشهٔ دوم درایوت به نام «ورودی استاد — پیشرفت دوره یادگیری ماشین» گذاشته می‌شود و آن پوشه یک لینک خواندن می‌گیرد که می‌توانی به استاد بدهی تا فایلت را از همان‌جا بردارد. این صفحه نمی‌تواند بدون اجازهٔ خود استاد مستقیم در درایو او بنویسد؛ این پوشهٔ مشترک در درایو خودت، همان پل است. اگر پایان روز صفحه بسته باشد، مرورگر کاری در پس‌زمینه انجام نمی‌دهد؛ ذخیره و ارسال پایان‌روز در آخرین لحظه‌های باز بودن صفحه و دوباره در اولین باز شدن روز بعد خودکار انجام می‌شود.</li>
+              <li><strong>قدم ۴ ـ آوردن:</strong> با دکمهٔ «آوردن فایل‌های تازه از پوشهٔ مشترک»، هر فایل تازه‌ای که در آن پوشه باشد خوانده و با پیشرفت همین مرورگر ادغام می‌شود؛ هیچ رکوردی دوبار شمرده نمی‌شود.</li>
+            </ul>
+            ${DriveSync.configured() ? "" : `<div class="callout warn">
+              <strong>قدم راه‌اندازی (فقط یک بار، توسط استاد):</strong> برای روشن شدن این اتصال، یک «شناسهٔ کاربری OAuth گوگل» لازم است. این شناسه <strong>رمز نیست</strong>؛ یک شناسهٔ عمومی است که گوگل برای هر برنامه صادر می‌کند. استاد باید در Google Cloud Console یک پروژه بسازد، Google Drive API را فعال کند، از بخش Credentials یک OAuth client ID از نوع Web application بسازد، نشانی همین صفحه را به‌عنوان مبدأ مجاز جاوااسکریپت ثبت کند و شناسهٔ صادرشده را در جای مشخص‌شده در کد همین صفحه (ثابت <span class="mono" dir="ltr">GOOGLE_OAUTH_CLIENT_ID</span>) بگذارد. تا وقتی این قدم انجام نشده، جای شناسه <strong>عمداً خالی</strong> است — هیچ شناسهٔ ساختگی در صفحه گذاشته نشده — و دکمهٔ اتصال به‌جای وانمود کردن، همین قدم را یادآوری می‌کند. بقیهٔ راه‌ها (ذخیره در همین مرورگر، ارسال خودکار به استاد و فایل خروجی پایین) بدون این قدم هم کار می‌کنند.
+            </div>`}
+            <p class="small dim">وضعیت اتصال درایو: ${esc(DriveSync.statusText())}</p>
+            ${DriveSync.state().sharedLink ? `<p class="small">لینک خواندن پوشهٔ مشترک برای استاد: <a href="${esc(DriveSync.state().sharedLink)}" target="_blank" rel="noopener" dir="ltr">باز کردن پوشهٔ «ورودی استاد»</a> — این لینک را برای استاد بفرست تا فایل پایان‌روزت را از همان‌جا بیاورد.</p>` : ""}
+            <div class="kbd-row" style="margin-top:4px">
+              <button type="button" class="btn primary" id="drive-connect">${DriveSync.connected() ? "متصل است ✓" : "اتصال درایو و دادن اجازه"}</button>
+              <button type="button" class="btn" id="drive-save" ${DriveSync.connected() ? "" : "disabled"}>ذخیرهٔ الان در درایو</button>
+              <button type="button" class="btn" id="drive-share" ${DriveSync.connected() ? "" : "disabled"}>ارسال الان برای استاد (پوشهٔ مشترک)</button>
+              <button type="button" class="btn" id="drive-fetch" ${DriveSync.connected() ? "" : "disabled"}>آوردن فایل‌های تازه از پوشهٔ مشترک</button>
+              ${DriveSync.connected() ? `<button type="button" class="btn danger-ghost" id="drive-disconnect">قطع اتصال درایو</button>` : ""}
+            </div>
+            <p class="small dim" style="margin-bottom:0">توکن اجازه فقط در حافظهٔ همین نشست مرورگر می‌ماند و با بستن مرورگر از بین می‌رود؛ دفعهٔ بعد با یک کلیک دوباره وصل می‌شوی. هر وقت خواستی، «قطع اتصال» اجازه را همان لحظه باطل می‌کند.</p>
+          </div>
+          <div class="card">
             <h2 class="sec">خروجی پیشرفت برای درایو</h2>
-            <p>همهٔ فعالیتت در این پوسته — باز کردن درس‌ها و میزان خواندن هر درس، پاسخ‌های آزمون و تمرین و نمره‌هایشان، اجراها و خطاهای آزمایشگاه، کد و چیدمان دفترچه‌ها، آموزش‌های برگشتی و پیشرفت تورها — با همان جدول‌هایی که سایت اصلی ثبت می‌کند، در همین مرورگر ثبت می‌شود و به‌صورت خودکار برای استاد هم ارسال می‌شود. این پوسته خودش مستقیم به درایو وصل نمی‌شود؛ فایل خروجی زیر، مسیر پشتیبان انتقال از راه درایو است.</p>
+            <p>همهٔ فعالیتت در این پوسته — باز کردن درس‌ها و میزان خواندن هر درس، پاسخ‌های آزمون و تمرین و نمره‌هایشان، اجراها و خطاهای آزمایشگاه، کد و چیدمان دفترچه‌ها، آموزش‌های برگشتی و پیشرفت تورها — با همان جدول‌هایی که سایت اصلی ثبت می‌کند، در همین مرورگر ثبت می‌شود و به‌صورت خودکار برای استاد هم ارسال می‌شود. اگر اتصال درایو در کارت بالا روشن باشد، همین فایل خودکار در درایو خودت ذخیره می‌شود؛ دکمهٔ زیر، مسیر دستی و پشتیبان همان انتقال است.</p>
             <p><strong>روزی ۲ بار</strong> (مثلاً صبح و شب) دکمهٔ زیر را بزن تا فایل <span class="mono" dir="ltr">shell-export-YYYYMMDD-HHMM.json</span> دانلود شود؛ بعد همان فایل را در پوشهٔ <strong>«ورودی-پوسته»</strong> داخل پوشهٔ <strong>«دیتابیس پوسته دانشجویی دوره یادگیری ماشین»</strong> در درایو بارگذاری کن. از همان‌جا مرحلهٔ انتقال به سایت اصلی آغاز می‌شود: Muse فایل را از درایو می‌خواند و رکوردها و خطاهایت را به سایت اصلی وارد می‌کند. ثبت رسمی پیشرفت و نمره در سایت اصلی است؛ فعالیتت علاوه بر ثبت در همین مرورگر، به‌صورت خودکار هم برای استاد ارسال می‌شود و این فایل، پشتیبان همان انتقال است.</p>
             <div class="callout key">
               <strong>چه چیزی ثبت و برای استاد ارسال می‌شود؟</strong> هر کاری در این پوسته انجام می‌دهی ثبت می‌شود: باز کردن و خواندن درس‌ها و میزان خواندنشان، پاسخ‌های آزمون و تمرین و نمره‌هایشان، اجراها و خطاهای آزمایشگاه و کد و چیدمان دفترچه‌ها، آموزش‌های برگشتی و پیشرفت تورها. این ثبت‌ها هم در همین مرورگر می‌مانند و هم خودکار برای استاد فرستاده می‌شوند تا پیشرفتت را از راه دور ببیند؛ اگر اینترنتت قطع باشد، در صف همین مرورگر می‌مانند و با وصل‌شدن اینترنت خودکار ارسال می‌شوند. این ثبت‌ها را <strong>فقط استاد</strong> می‌بیند.
@@ -1693,6 +1959,39 @@
         });
         const importCancel = document.getElementById("dash-import-cancel");
         if (importCancel) importCancel.addEventListener("click", () => { pendingTransferImport = null; render(); });
+        const driveConnect = document.getElementById("drive-connect");
+        if (driveConnect) driveConnect.addEventListener("click", async () => {
+          if (!DriveSync.configured()) { toast("قدم راه‌اندازی هنوز انجام نشده است: استاد باید اول شناسهٔ کاربری OAuth گوگل را بسازد و در جای مشخص‌شده در کد صفحه بگذارد؛ توضیح کاملش در همین کارت هست. هیچ شناسهٔ ساختگی در صفحه نیست."); return; }
+          if (DriveSync.connected()) { toast("درایو همین حالا متصل است و ذخیرهٔ خودکار فعال است."); return; }
+          driveConnect.disabled = true;
+          const r = await DriveSync.connect(true);
+          if (r.ok) { toast("درایو وصل شد؛ از حالا پیشرفتت خودکار در درایو خودت ذخیره می‌شود و پایان هر روز برای استاد می‌رود."); await DriveSync.saveNow(); }
+          else toast("اتصال درایو انجام نشد؛ پنجرهٔ اجازهٔ گوگل بسته شد یا اجازه داده نشد. هر وقت آماده بودی دوباره تلاش کن.");
+          render();
+        });
+        const driveSave = document.getElementById("drive-save");
+        if (driveSave) driveSave.addEventListener("click", async () => {
+          driveSave.disabled = true;
+          const r = await DriveSync.saveNow();
+          toast(r.ok ? "پیشرفتت همین حالا در درایو خودت ذخیره شد." : "ذخیره در درایو نشد؛ اتصال را بررسی کن و دوباره تلاش کن — پیشرفتت در همین مرورگر امن است.");
+          render();
+        });
+        const driveShare = document.getElementById("drive-share");
+        if (driveShare) driveShare.addEventListener("click", async () => {
+          driveShare.disabled = true;
+          const r = await DriveSync.shareWithTeacher();
+          toast(r.ok ? "تازه‌ترین فایل پیشرفتت در پوشهٔ مشترک «ورودی استاد» گذاشته شد؛ لینک خواندن پوشه در همین کارت هست تا برای استاد بفرستی." : "ارسال به پوشهٔ مشترک نشد؛ اتصال درایو را بررسی کن و دوباره تلاش کن.");
+          render();
+        });
+        const driveFetch = document.getElementById("drive-fetch");
+        if (driveFetch) driveFetch.addEventListener("click", async () => {
+          driveFetch.disabled = true;
+          const r = await DriveSync.fetchNewFromShared();
+          toast(r.ok ? (r.brought > 0 ? `${faNum(r.brought)} فایل تازه از پوشهٔ مشترک آورده و بدون تکرار ادغام شد.` : "فایل تازه‌ای در پوشهٔ مشترک نبود.") : "آوردن از پوشهٔ مشترک نشد؛ اتصال درایو را بررسی کن و دوباره تلاش کن.");
+          render();
+        });
+        const driveDisconnect = document.getElementById("drive-disconnect");
+        if (driveDisconnect) driveDisconnect.addEventListener("click", () => { DriveSync.disconnect(); toast("اتصال درایو قطع و اجازه باطل شد؛ پیشرفتت در همین مرورگر و فایل‌هایی که تا حالا در درایوت ذخیره شده‌اند سر جایشان می‌مانند."); render(); });
         const syncBtn = document.getElementById("dash-sync");
         if (syncBtn) syncBtn.addEventListener("click", async () => {
           syncBtn.disabled = true;
@@ -3432,6 +3731,7 @@ function explainError(raw, code) {
         sessionAbsenceDays = prev ? Math.floor((Date.now() - prev) / 86400000) : null;
         Recorder.sessionStart();
         SupaSync.schedule();
+        DriveSync.boot();
         let scrollTick = 0;
         window.addEventListener("scroll", () => {
           const t = Date.now();
